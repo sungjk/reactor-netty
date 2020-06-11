@@ -29,17 +29,35 @@ import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.HttpClientUpgradeHandler;
 import io.netty.handler.codec.http.HttpContentDecompressor;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.cookie.ClientCookieDecoder;
 import io.netty.handler.codec.http.cookie.ClientCookieEncoder;
+import io.netty.handler.codec.http2.Http2ClientUpgradeCodec;
+import io.netty.handler.codec.http2.Http2FrameCodec;
+import io.netty.handler.codec.http2.Http2FrameCodecBuilder;
+import io.netty.handler.codec.http2.Http2FrameLogger;
+import io.netty.handler.codec.http2.Http2MultiplexHandler;
+import io.netty.handler.codec.http2.Http2Settings;
+import io.netty.handler.codec.http2.Http2StreamChannel;
+import io.netty.handler.codec.http2.Http2StreamChannelBootstrap;
+import io.netty.handler.codec.http2.Http2StreamFrameToHttpObjectCodec;
+import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
+import io.netty.handler.ssl.ApplicationProtocolNames;
+import io.netty.handler.ssl.SslHandler;
 import io.netty.resolver.AddressResolverGroup;
+import io.netty.util.concurrent.Future;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Mono;
 import reactor.netty.ChannelPipelineConfigurer;
@@ -57,7 +75,12 @@ import reactor.netty.resources.LoopResources;
 import reactor.netty.tcp.SslProvider;
 import reactor.netty.transport.ClientTransportConfig;
 import reactor.netty.transport.ProxyProvider;
+import reactor.util.Logger;
+import reactor.util.Loggers;
 import reactor.util.annotation.Nullable;
+
+import static reactor.netty.ReactorNetty.format;
+import static reactor.netty.http.client.Http2ConnectionProvider.OWNER;
 
 /**
  * Encapsulate all necessary configuration for HTTP client transport. The public API is read-only.
@@ -131,6 +154,15 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 	 */
 	public HttpHeaders headers() {
 		return headers.copy();
+	}
+
+	/**
+	 * Return a copy of the HTTP/2 configuration
+	 *
+	 * @return a copy of the HTTP/2 configuration
+	 */
+	public Http2Settings http2Settings() {
+		return new Http2Settings().copyFrom(http2Settings);
 	}
 
 	/**
@@ -250,6 +282,7 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 	BiConsumer<? super HttpClientResponse, ? super Throwable> doOnResponseError;
 	BiPredicate<HttpClientRequest, HttpClientResponse> followRedirectPredicate;
 	HttpHeaders headers;
+	Http2Settings http2Settings;
 	HttpMethod method;
 	HttpProtocol[] protocols;
 	int _protocols;
@@ -269,6 +302,7 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 		this.cookieEncoder = ClientCookieEncoder.STRICT;
 		this.decoder = new HttpResponseDecoderSpec();
 		this.headers = new DefaultHttpHeaders();
+		this.http2Settings = Http2Settings.defaultSettings();
 		this.method = HttpMethod.GET;
 		this.protocols = new HttpProtocol[]{HttpProtocol.HTTP11};
 		this._protocols = h11;
@@ -294,6 +328,7 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 		this.doOnResponseError = parent.doOnResponseError;
 		this.followRedirectPredicate = parent.followRedirectPredicate;
 		this.headers = parent.headers;
+		this.http2Settings = parent.http2Settings;
 		this.method = parent.method;
 		this.protocols = parent.protocols;
 		this._protocols = parent._protocols;
@@ -335,10 +370,10 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 	}
 
 	@Override
-	@SuppressWarnings("unchecked")
 	protected ChannelPipelineConfigurer defaultOnChannelInit() {
 		return super.defaultOnChannelInit()
-		            .then(new HttpClientChannelInitializer(acceptGzip, decoder, metricsRecorder(), _protocols, sslProvider, uriTagValue));
+		            .then(new HttpClientChannelInitializer(acceptGzip, decoder, http2Settings,
+		                metricsRecorder(), channelOperationsProvider(), _protocols, sslProvider, uriTagValue));
 	}
 
 	@Override
@@ -389,6 +424,76 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 		this._protocols = _protocols;
 	}
 
+	static void configureHttp2Pipeline(ChannelPipeline p, HttpResponseDecoderSpec decoder, Http2Settings http2Settings,
+			ConnectionObserver observer) {
+		Http2FrameCodecBuilder http2FrameCodecBuilder =
+				Http2FrameCodecBuilder.forClient()
+				                      .validateHeaders(decoder.validateHeaders())
+				                      .initialSettings(http2Settings);
+
+		if (p.get(NettyPipeline.LoggingHandler) != null) {
+			http2FrameCodecBuilder.frameLogger(new Http2FrameLogger(LogLevel.DEBUG,
+					"reactor.netty.http.client.h2"));
+		}
+
+		p.addBefore(NettyPipeline.ReactiveBridge, NettyPipeline.HttpCodec, http2FrameCodecBuilder.build())
+		 .addBefore(NettyPipeline.ReactiveBridge, NettyPipeline.H2MultiplexHandler, new Http2MultiplexHandler(new H2Codec()))
+		 .addBefore(NettyPipeline.ReactiveBridge, NettyPipeline.HttpTrafficHandler, new HttpTrafficHandler(observer));
+	}
+
+	static void configureHttp11OrH2CleartextPipeline(
+			ChannelPipeline p,
+			boolean acceptGzip,
+			HttpResponseDecoderSpec decoder,
+			@Nullable Supplier<? extends ChannelMetricsRecorder> metricsRecorder,
+			ConnectionObserver observer,
+			ChannelOperations.OnSetup opsFactory,
+			@Nullable Function<String, String> uriTagValue) {
+		HttpClientCodec httpClientCodec =
+				new HttpClientCodec(
+						decoder.maxInitialLineLength(),
+						decoder.maxHeaderSize(),
+						decoder.maxChunkSize(),
+						decoder.failOnMissingResponse,
+						decoder.validateHeaders(),
+						decoder.initialBufferSize(),
+						decoder.parseHttpAfterConnectRequest);
+
+		Http2FrameCodecBuilder http2FrameCodecBuilder =
+				Http2FrameCodecBuilder.forClient()
+						.validateHeaders(decoder.validateHeaders())
+						.initialSettings(Http2Settings.defaultSettings());
+
+		if (p.get(NettyPipeline.LoggingHandler) != null) {
+			http2FrameCodecBuilder.frameLogger(new Http2FrameLogger(LogLevel.DEBUG,
+					"reactor.netty.http.client.h2"));
+		}
+
+		Http2FrameCodec http2FrameCodec = http2FrameCodecBuilder.build();
+
+		Http2ClientUpgradeCodec upgradeCodec = new Http2ClientUpgradeCodec(http2FrameCodec, new H2CleartextCodec(http2FrameCodec, opsFactory));
+
+		HttpClientUpgradeHandler upgradeHandler = new HttpClientUpgradeHandler(httpClientCodec, upgradeCodec, decoder.h2cMaxContentLength());
+
+		p.addBefore(NettyPipeline.ReactiveBridge, null, httpClientCodec)
+		 .addBefore(NettyPipeline.ReactiveBridge, NettyPipeline.H2CUpgradeHandler, upgradeHandler)
+		 .addBefore(NettyPipeline.ReactiveBridge, NettyPipeline.HttpTrafficHandler, new HttpTrafficHandler(observer));
+
+		if (acceptGzip) {
+			p.addAfter(NettyPipeline.HttpCodec, NettyPipeline.HttpDecompressor, new HttpContentDecompressor());
+		}
+
+		if (metricsRecorder != null) {
+			ChannelMetricsRecorder channelMetricsRecorder = metricsRecorder.get();
+			if (channelMetricsRecorder instanceof HttpClientMetricsRecorder) {
+				p.addBefore(NettyPipeline.ReactiveBridge,
+						NettyPipeline.HttpMetricsHandler,
+						new HttpClientMetricsHandler((HttpClientMetricsRecorder) channelMetricsRecorder, uriTagValue));
+			}
+		}
+
+	}
+
 	static void configureHttp11Pipeline(ChannelPipeline p,
 			boolean acceptGzip,
 			HttpResponseDecoderSpec decoder,
@@ -406,9 +511,7 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 						decoder.parseHttpAfterConnectRequest));
 
 		if (acceptGzip) {
-			p.addAfter(NettyPipeline.HttpCodec,
-					NettyPipeline.HttpDecompressor,
-					new HttpContentDecompressor());
+			p.addAfter(NettyPipeline.HttpCodec, NettyPipeline.HttpDecompressor, new HttpContentDecompressor());
 		}
 
 		if (metricsRecorder != null) {
@@ -419,6 +522,13 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 						new HttpClientMetricsHandler((HttpClientMetricsRecorder) channelMetricsRecorder, uriTagValue));
 			}
 		}
+	}
+
+	static Future<Http2StreamChannel> openStream(Channel channel, ConnectionObserver observer, ChannelOperations.OnSetup opsFactory) {
+		Http2StreamChannelBootstrap bootstrap = new Http2StreamChannelBootstrap(channel);
+		bootstrap.option(ChannelOption.AUTO_READ, false);
+		bootstrap.handler(new H2Codec(observer, opsFactory));
+		return bootstrap.open();
 	}
 
 	static final Pattern FOLLOW_REDIRECT_CODES = Pattern.compile("30[1278]");
@@ -438,6 +548,8 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 
 	static final int h11orH2C = h11 | h2c;
 
+	static final Logger log = Loggers.getLogger(HttpClientConfig.class);
+
 	static final LoggingHandler LOGGING_HANDLER = new LoggingHandler(HttpClient.class);
 
 	/**
@@ -446,11 +558,133 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 	 */
 	static final boolean SSL_DEBUG = Boolean.parseBoolean(System.getProperty(ReactorNetty.SSL_CLIENT_DEBUG, "false"));
 
+	static final class H2CleartextCodec extends ChannelHandlerAdapter {
+
+		final Http2FrameCodec http2FrameCodec;
+		final ChannelOperations.OnSetup opsFactory;
+
+		H2CleartextCodec(Http2FrameCodec http2FrameCodec, ChannelOperations.OnSetup opsFactory) {
+			this.http2FrameCodec = http2FrameCodec;
+			this.opsFactory = opsFactory;
+		}
+
+		@Override
+		public void handlerAdded(ChannelHandlerContext ctx) {
+			ChannelPipeline pipeline = ctx.pipeline();
+			pipeline.addAfter(ctx.name(), NettyPipeline.HttpCodec, http2FrameCodec)
+			        .addAfter(NettyPipeline.HttpCodec, NettyPipeline.H2MultiplexHandler,
+			                new Http2MultiplexHandler(new H2Codec(opsFactory), new H2Codec(opsFactory)));
+			if (pipeline.get(NettyPipeline.HttpDecompressor) != null) {
+				pipeline.remove(NettyPipeline.HttpDecompressor);
+			}
+			pipeline.remove(NettyPipeline.ReactiveBridge);
+			pipeline.remove(this);
+		}
+	}
+
+	static final class H2Codec extends ChannelInitializer<Channel> {
+		final ConnectionObserver observer;
+		final ChannelOperations.OnSetup opsFactory;
+
+		H2Codec() {
+			this(null, null);
+		}
+
+		H2Codec(@Nullable ChannelOperations.OnSetup opsFactory) {
+			this(null, opsFactory);
+		}
+
+		H2Codec(@Nullable ConnectionObserver observer, @Nullable ChannelOperations.OnSetup opsFactory) {
+			this.observer = observer;
+			this.opsFactory = opsFactory;
+		}
+
+		@Override
+		protected void initChannel(Channel ch) {
+			ConnectionObserver obs = this.observer;
+			if (obs == null) {
+				ConnectionObserver owner = ch.parent().attr(OWNER).get();
+				if (owner instanceof Http2ConnectionProvider.DisposableAcquire) {
+					obs = ((Http2ConnectionProvider.DisposableAcquire) owner).obs;
+				}
+			}
+			if (obs != null && opsFactory != null) {
+				addStreamHandlers(ch, obs, opsFactory);
+			}
+			else {
+				// TODO handle server pushes
+			}
+		}
+
+		static void addStreamHandlers(Channel ch, ConnectionObserver obs, ChannelOperations.OnSetup opsFactory) {
+			ch.pipeline()
+			  .addLast(NettyPipeline.H2ToHttp11Codec, new Http2StreamFrameToHttpObjectCodec(false))
+			  .addLast(NettyPipeline.HttpTrafficHandler, new Http2StreamBridgeClientHandler(obs, opsFactory));
+
+			ChannelOperations.addReactiveBridge(ch, opsFactory, obs);
+
+			if (log.isDebugEnabled()) {
+				log.debug(format(ch, "Initialized HTTP/2 stream pipeline {}"), ch.pipeline());
+			}
+		}
+	}
+
+	static final class H2OrHttp11Codec extends ChannelInboundHandlerAdapter {
+		final boolean                                    acceptGzip;
+		final HttpResponseDecoderSpec                    decoder;
+		final Http2Settings                              http2Settings;
+		final Supplier<? extends ChannelMetricsRecorder> metricsRecorder;
+		final ConnectionObserver                         observer;
+		final Function<String, String>                   uriTagValue;
+
+		H2OrHttp11Codec(
+				boolean acceptGzip,
+				HttpResponseDecoderSpec decoder,
+				Http2Settings http2Settings,
+				@Nullable Supplier<? extends ChannelMetricsRecorder> metricsRecorder,
+				ConnectionObserver observer,
+				@Nullable Function<String, String> uriTagValue) {
+			this.acceptGzip = acceptGzip;
+			this.decoder = decoder;
+			this.http2Settings = http2Settings;
+			this.metricsRecorder = metricsRecorder;
+			this.observer = observer;
+			this.uriTagValue = uriTagValue;
+		}
+
+		@Override
+		public void channelActive(ChannelHandlerContext ctx) {
+			SslHandler sslHandler = ctx.pipeline().get(SslHandler.class);
+			if (sslHandler == null) {
+				throw new IllegalStateException("Cannot determine negotiated application-level protocol.");
+			}
+			String protocol = sslHandler.applicationProtocol() != null ? sslHandler.applicationProtocol() : ApplicationProtocolNames.HTTP_1_1;
+			if (log.isDebugEnabled()) {
+				log.debug(format(ctx.channel(), "Negotiated application-level protocol [" + protocol + "]"));
+			}
+			if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
+				configureHttp2Pipeline(ctx.channel().pipeline(), decoder, http2Settings, observer);
+			}
+			else if (ApplicationProtocolNames.HTTP_1_1.equals(protocol)) {
+				configureHttp11Pipeline(ctx.channel().pipeline(), acceptGzip, decoder, metricsRecorder, uriTagValue);
+			}
+			else {
+				throw new IllegalStateException("unknown protocol: " + protocol);
+			}
+
+			ctx.fireChannelActive();
+
+			ctx.channel().pipeline().remove(this);
+		}
+	}
+
 	static final class HttpClientChannelInitializer implements ChannelPipelineConfigurer {
 
 		final boolean                                    acceptGzip;
 		final HttpResponseDecoderSpec                    decoder;
+		final Http2Settings                              http2Settings;
 		final Supplier<? extends ChannelMetricsRecorder> metricsRecorder;
+		final ChannelOperations.OnSetup                  opsFactory;
 		final int                                        protocols;
 		final SslProvider                                sslProvider;
 		final Function<String, String>                   uriTagValue;
@@ -458,13 +692,17 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 		HttpClientChannelInitializer(
 				boolean acceptGzip,
 				HttpResponseDecoderSpec decoder,
+				Http2Settings http2Settings,
 				@Nullable Supplier<? extends ChannelMetricsRecorder> metricsRecorder,
+				ChannelOperations.OnSetup opsFactory,
 				int protocols,
 				@Nullable SslProvider sslProvider,
 				@Nullable Function<String, String> uriTagValue) {
 			this.acceptGzip = acceptGzip;
 			this.decoder = decoder;
+			this.http2Settings = http2Settings;
 			this.metricsRecorder = metricsRecorder;
+			this.opsFactory = opsFactory;
 			this.protocols = protocols;
 			this.sslProvider = sslProvider;
 			this.uriTagValue = uriTagValue;
@@ -474,10 +712,29 @@ public final class HttpClientConfig extends ClientTransportConfig<HttpClientConf
 		public void onChannelInit(ConnectionObserver observer, Channel channel, @Nullable SocketAddress remoteAddress) {
 			if (sslProvider != null) {
 				sslProvider.addSslHandler(channel, remoteAddress, SSL_DEBUG);
-			}
 
-			if ((protocols & h11) == h11) {
-				configureHttp11Pipeline(channel.pipeline(), acceptGzip, decoder, metricsRecorder, uriTagValue);
+				if ((protocols & h11orH2) == h11orH2) {
+					channel.pipeline()
+					       .addBefore(NettyPipeline.ReactiveBridge, NettyPipeline.H2OrHttp11Codec,
+					               new H2OrHttp11Codec(acceptGzip, decoder, http2Settings, metricsRecorder, observer, uriTagValue));
+				}
+				else if ((protocols & h11) == h11) {
+					configureHttp11Pipeline(channel.pipeline(), acceptGzip, decoder, metricsRecorder, uriTagValue);
+				}
+				else if ((protocols & h2) == h2) {
+					configureHttp2Pipeline(channel.pipeline(), decoder, http2Settings, observer);
+				}
+			}
+			else {
+				if ((protocols & h11orH2C) == h11orH2C) {
+					configureHttp11OrH2CleartextPipeline(channel.pipeline(), acceptGzip, decoder, metricsRecorder, observer, opsFactory, uriTagValue);
+				}
+				else if ((protocols & h11) == h11) {
+					configureHttp11Pipeline(channel.pipeline(), acceptGzip, decoder, metricsRecorder, uriTagValue);
+				}
+				else if ((protocols & h2c) == h2c) {
+					configureHttp2Pipeline(channel.pipeline(), decoder, http2Settings, observer);
+				}
 			}
 		}
 	}

@@ -37,6 +37,7 @@ import io.netty.handler.codec.http.cookie.ClientCookieDecoder;
 import io.netty.handler.codec.http.cookie.ClientCookieEncoder;
 import io.netty.handler.codec.http.cookie.Cookie;
 import io.netty.handler.codec.http.cookie.DefaultCookie;
+import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.ssl.SslContext;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
@@ -384,7 +385,7 @@ public abstract class HttpClient extends ClientTransport<HttpClient, HttpClientC
 	 * @return a {@link HttpClient}
 	 */
 	public static HttpClient create() {
-		return create(HttpResources.get());
+		return new HttpClientConnect(new HttpConnectionProvider(HttpResources.get(), Http2Resources::get));
 	}
 
 	/**
@@ -392,10 +393,29 @@ public abstract class HttpClient extends ClientTransport<HttpClient, HttpClientC
 	 * {@link #baseUrl(String)} should be invoked before a verb
 	 * {@link #request(HttpMethod)} is selected.
 	 *
+	 * @param connectionProvider the {@link ConnectionProvider} to be used
 	 * @return a {@link HttpClient}
 	 */
 	public static HttpClient create(ConnectionProvider connectionProvider) {
-		return new HttpClientConnect(connectionProvider);
+		Objects.requireNonNull(connectionProvider, "connectionProvider");
+		return new HttpClientConnect(new HttpConnectionProvider(connectionProvider));
+	}
+
+	/**
+	 * Prepare an {@link HttpClient}. {@link UriConfiguration#uri(String)} or
+	 * {@link #baseUrl(String)} should be invoked before a verb
+	 * {@link #request(HttpMethod)} is selected.
+	 *
+	 * @param connectionProvider the {@link ConnectionProvider} to be used
+	 * @param maxHttp2Connections the max number of connections that will be used for HTTP/2 requests
+	 * @return a {@link HttpClient}
+	 */
+	public static HttpClient create(ConnectionProvider connectionProvider, int maxHttp2Connections) {
+		Objects.requireNonNull(connectionProvider, "connectionProvider");
+		if (maxHttp2Connections <= 0) {
+			throw new IllegalArgumentException("Max HTTP/2 connections value must be strictly positive");
+		}
+		return new HttpClientConnect(new HttpConnectionProvider(connectionProvider, maxHttp2Connections));
 	}
 	/**
 	 * Prepare an {@link HttpClient}
@@ -416,7 +436,7 @@ public abstract class HttpClient extends ClientTransport<HttpClient, HttpClientC
 	 * @return a {@link HttpClient}
 	 */
 	public static HttpClient newConnection() {
-		return HttpClientConnect.INSTANCE;
+		return new HttpClientConnect(new HttpConnectionProvider(ConnectionProvider.newConnection()));
 	}
 
 	/**
@@ -908,6 +928,21 @@ public abstract class HttpClient extends ClientTransport<HttpClient, HttpClientC
 				                 config.headers = h;
 				                 return config;
 				             }));
+		return dup;
+	}
+
+	/**
+	 * Apply HTTP/2 configuration
+	 *
+	 * @param http2Settings configures {@link Http2Settings} before requesting
+	 * @return a new {@link HttpClient}
+	 */
+	public final HttpClient http2Setting(Consumer<Http2Settings> http2Settings) {
+		Objects.requireNonNull(http2Settings, "http2Settings");
+		HttpClient dup = duplicate();
+		Http2Settings settings = new Http2Settings().copyFrom(configuration().http2Settings);
+		http2Settings.accept(settings);
+		dup.configuration().http2Settings = settings;
 		return dup;
 	}
 

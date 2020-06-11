@@ -27,6 +27,7 @@ import java.util.function.Supplier;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
 import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
+import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 import org.reactivestreams.Publisher;
@@ -227,6 +228,21 @@ public abstract class HttpServer extends ServerTransport<HttpServer, HttpServerC
 	@Override
 	public final HttpServer host(String host) {
 		return super.host(host);
+	}
+
+	/**
+	 * Apply HTTP/2 configuration
+	 *
+	 * @param http2Settings configures {@link Http2Settings} before requesting
+	 * @return a new {@link HttpServer}
+	 */
+	public final HttpServer http2Setting(Consumer<Http2Settings> http2Settings) {
+		Objects.requireNonNull(http2Settings, "http2Settings");
+		HttpServer dup = duplicate();
+		Http2Settings settings = new Http2Settings().copyFrom(configuration().http2Settings);
+		http2Settings.accept(settings);
+		dup.configuration().http2Settings = settings;
+		return dup;
 	}
 
 	/**
